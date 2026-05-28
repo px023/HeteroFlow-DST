@@ -330,8 +330,7 @@ Test coverage (after LK / watershed / Strategy B removals):
 * Growth analysis (length, monotonicity, rolling-rate type)
 * Configuration (path + parameter presence + types)
 
-End-to-end validation lives in `test_heteroresistance_real_data.py`; running
-it is the canonical "everything still works" check.
+End-to-end validation lives in `test_heteroresistance_real_data.py`.
 
 ## Output
 
