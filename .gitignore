@@ -1,8 +1,34 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# Environments
 .venv/
+venv/
+env/
+
+# Test caches
 .pytest_cache/
+.mypy_cache/
+
+# Data + outputs
 data/
 results/
 test_results/
 EXP-23-*
+*.tar.bz2
+*.pickle
+*.pkl
+
+# IDE / editor configs
+.idea/
+.vscode/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

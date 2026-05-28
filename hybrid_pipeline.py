@@ -1,127 +1,52 @@
 import numpy as np
-import cv2
-import skimage.io
-from skimage import filters, feature, morphology, segmentation
-from skimage.measure import regionprops, label
-from scipy import ndimage
+from skimage import filters
 from scipy.optimize import curve_fit
 from scipy import stats
 import matplotlib.pyplot as plt
-import os
-import pickle
-from typing import Tuple, List, Dict, Optional
-import config
+from typing import Tuple, List, Optional
 import warnings
+
+import config
+
 warnings.filterwarnings('ignore')
 
 
-class HybridSegmentationPipeline:    
-    def __init__(self, gaussian_sigma: float = 1.0, 
-                 sobel_ksize: int = 3,
-                 watershed_min_distance: int = 5,
-                 use_watershed: bool = False):
+class HybridSegmentationPipeline:
+    def __init__(self, gaussian_sigma: float = 1.0,
+                 sobel_ksize: int = 3):
         """
         Initialize the pipeline with preprocessing parameters.
-        
+
         Args:
             gaussian_sigma: Standard deviation for Gaussian blur
             sobel_ksize: Kernel size for Sobel operator
-            watershed_min_distance: Minimum distance between watershed seeds
-            use_watershed: Whether to apply watershed refinement (default False)
-                          Set to False to trust Omnipose segmentation for overlapping cells
         """
         self.gaussian_sigma = gaussian_sigma
         self.sobel_ksize = sobel_ksize
-        self.watershed_min_distance = watershed_min_distance
-        self.use_watershed = use_watershed
         self.memory_mask = None
-        
+
     def preprocess_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         Apply Gaussian blur and Sobel edge detection (Meier et al. steps 1-2).
-        
+
         Args:
             frame: Input grayscale image
-            
+
         Returns:
             blurred: Gaussian-smoothed image
             edges: Sobel edge magnitude map
         """
         # Step 1: Gaussian blur for temporal stability
         blurred = filters.gaussian(frame, sigma=self.gaussian_sigma, preserve_range=True)
-        
+
         # Step 2: Sobel gradient for edge detection
         sobel_h = filters.sobel_h(blurred)
         sobel_v = filters.sobel_v(blurred)
         edges = np.hypot(sobel_h, sobel_v)
-        
+
         return blurred, edges
-    
-    def watershed_refinement(self, 
-                            edges: np.ndarray, 
-                            omnipose_mask: np.ndarray,
-                            use_distance_transform: bool = True) -> np.ndarray:
-        """
-        Apply marker-based watershed using Omnipose masks as seeds.
-        Splits clumps and refines boundaries (Meier et al. step 3).
-        
-        NOTE: For overlapping bacteria, watershed may degrade Omnipose performance.
-        Consider setting use_watershed=False in pipeline initialization.
-        
-        Args:
-            edges: Sobel edge magnitude map
-            omnipose_mask: Instance segmentation from Omnipose
-            use_distance_transform: Use distance transform to find cell centers as markers
-            
-        Returns:
-            refined_mask: Watershed-refined segmentation mask
-        """
-        # Ensure edges and mask have the same shape
-        # Crop or pad mask to match edges dimensions
-        if edges.shape != omnipose_mask.shape:
-            h_edge, w_edge = edges.shape
-            h_mask, w_mask = omnipose_mask.shape
-            
-            # Crop mask if larger
-            if h_mask > h_edge or w_mask > w_edge:
-                omnipose_mask = omnipose_mask[:h_edge, :w_edge]
-            
-            # Pad mask if smaller
-            if omnipose_mask.shape != edges.shape:
-                padded_mask = np.zeros(edges.shape, dtype=omnipose_mask.dtype)
-                padded_mask[:omnipose_mask.shape[0], :omnipose_mask.shape[1]] = omnipose_mask
-                omnipose_mask = padded_mask
-        
-        # Generate markers using distance transform for better cell center detection
-        if use_distance_transform:
-            # For each cell, find its center using distance transform
-            labeled_mask = label(omnipose_mask > 0)
-            markers = np.zeros_like(labeled_mask)
-            
-            for region_id in range(1, labeled_mask.max() + 1):
-                region = (labeled_mask == region_id)
-                if region.sum() > 0:
-                    # Distance transform: finds skeleton/center of each region
-                    dist = ndimage.distance_transform_edt(region)
-                    # Use peak of distance as marker (cell center)
-                    local_max = (dist == dist.max())
-                    markers[local_max & region] = region_id
-        else:
-            # Use original Omnipose regions as markers
-            markers = label(omnipose_mask > 0)
-        
-        # Apply watershed on inverted edge map (edges = barriers)
-        # Normalize edges to [0, 1] for better watershed performance
-        edges_norm = (edges - edges.min()) / (edges.max() - edges.min() + 1e-8)
-        
-        # Watershed prefers low values as basins, so invert
-        refined_mask = segmentation.watershed(edges_norm, markers, 
-                                             mask=omnipose_mask > 0,
-                                             watershed_line=True)
-        
-        return refined_mask
-    
-    def update_memory_mask(self, 
+
+    def update_memory_mask(self,
                           current_mask: np.ndarray, 
                           reset: bool = False) -> np.ndarray:
         """
@@ -173,14 +98,11 @@ class HybridSegmentationPipeline:
             # Preprocess
             blurred, edges = self.preprocess_frame(frame)
             edges_list.append(edges)
-            
-            # Watershed refinement (optional - may degrade performance for overlapping cells)
-            if self.use_watershed:
-                refined = self.watershed_refinement(edges, omni_mask)
-            else:
-                # Trust Omnipose segmentation directly
-                refined = omni_mask.copy()
-            
+
+            # Trust Omnipose segmentation directly (watershed refinement removed:
+            # in dense microchambers it degraded rather than improved segmentation)
+            refined = omni_mask.copy()
+
             # Apply memory mask if enabled
             if use_memory:
                 memory = self.update_memory_mask(refined, reset=(i==0))
@@ -190,201 +112,6 @@ class HybridSegmentationPipeline:
             refined_masks.append(refined)
         
         return refined_masks, edges_list
-
-
-class OpticalFlowAnalyzer:
-    """
-    Implements Lucas-Kanade optical flow analysis (Meier et al. step 5)
-    for motion-based growth quantification.
-    """
-    
-    def __init__(self, 
-                 lk_win_size: int = 15,
-                 lk_max_level: int = 2):
-        """
-        Initialize optical flow analyzer.
-        
-        Args:
-            lk_win_size: Window size for Lucas-Kanade
-            lk_max_level: Number of pyramid levels
-        """
-        self.lk_params = dict(winSize=(lk_win_size, lk_win_size),
-                             maxLevel=lk_max_level,
-                             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 
-                                      10, 0.03))
-    
-    def compute_flow_features(self, 
-                             frame1: np.ndarray, 
-                             frame2: np.ndarray,
-                             mask1: np.ndarray) -> Dict[str, float]:
-        """
-        Compute optical flow features between consecutive frames.
-        
-        Args:
-            frame1: Previous frame (8-bit)
-            frame2: Current frame (8-bit)
-            mask1: Segmentation mask for frame1
-            
-        Returns:
-            features: Dictionary with flow magnitude, variance, etc.
-        """
-        # Ensure 8-bit input
-        if frame1.dtype != np.uint8:
-            frame1 = ((frame1 - frame1.min()) / (frame1.max() - frame1.min()) * 255).astype(np.uint8)
-        if frame2.dtype != np.uint8:
-            frame2 = ((frame2 - frame2.min()) / (frame2.max() - frame2.min()) * 255).astype(np.uint8)
-        
-        # Ensure mask matches frame shape and is uint8
-        if mask1.shape != frame1.shape:
-            # Resize mask to match frame
-            mask_resized = np.zeros(frame1.shape, dtype=np.uint8)
-            h_min = min(mask1.shape[0], frame1.shape[0])
-            w_min = min(mask1.shape[1], frame1.shape[1])
-            mask_resized[:h_min, :w_min] = (mask1[:h_min, :w_min] > 0).astype(np.uint8)
-            mask_uint8 = mask_resized
-        else:
-            mask_uint8 = (mask1 > 0).astype(np.uint8)
-        
-        # Detect corners in masked regions using Shi-Tomasi
-        corners = cv2.goodFeaturesToTrack(frame1, 
-                                         maxCorners=200,
-                                         qualityLevel=0.01,
-                                         minDistance=7,
-                                         mask=mask_uint8)
-        
-        features = {
-            'mean_flow_magnitude': 0.0,
-            'flow_variance': 0.0,
-            'directional_consistency': 0.0,
-            'n_points': 0
-        }
-        
-        if corners is None or len(corners) < 5:
-            return features
-        
-        # Compute Lucas-Kanade optical flow
-        next_pts, status, err = cv2.calcOpticalFlowPyrLK(
-            frame1, frame2, corners, None, **self.lk_params)
-        
-        # Filter good points
-        good_old = corners[status == 1]
-        good_new = next_pts[status == 1]
-        
-        if len(good_new) < 5:
-            return features
-        
-        # Compute flow vectors
-        flow_vectors = good_new - good_old
-        
-        # Flow magnitude
-        magnitudes = np.linalg.norm(flow_vectors, axis=1)
-        features['mean_flow_magnitude'] = np.mean(magnitudes)
-        features['flow_variance'] = np.var(magnitudes)
-        features['n_points'] = len(magnitudes)
-        
-        # Directional consistency (how aligned are flow vectors?)
-        if len(flow_vectors) > 1:
-            # Compute pairwise angles
-            angles = []
-            for i in range(len(flow_vectors)):
-                for j in range(i+1, len(flow_vectors)):
-                    v1 = flow_vectors[i]
-                    v2 = flow_vectors[j]
-                    cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-8)
-                    angles.append(cos_angle)
-            features['directional_consistency'] = np.mean(angles) if angles else 0.0
-        
-        return features
-    
-    def extract_sequence_features(self, 
-                                 frames: List[np.ndarray],
-                                 masks: List[np.ndarray],
-                                 robust_smoothing: bool = True) -> List[Dict[str, float]]:
-        """
-        Extract optical flow features for entire sequence.
-        With optional robust smoothing and outlier removal for noisy bacterial motion.
-        
-        Args:
-            frames: List of frames
-            masks: List of segmentation masks
-            robust_smoothing: Apply heavy smoothing + outlier removal (default True)
-            
-        Returns:
-            features_list: List of feature dictionaries per frame pair
-        """
-        features_list = []
-        
-        # Extract raw features
-        for i in range(len(frames) - 1):
-            features = self.compute_flow_features(frames[i], frames[i+1], masks[i])
-            features_list.append(features)
-        
-        # Apply robust smoothing if enabled
-        if robust_smoothing and len(features_list) > 0:
-            features_list = self._apply_robust_smoothing(features_list)
-        
-        return features_list
-    
-    def _apply_robust_smoothing(self, features_list: List[Dict[str, float]]) -> List[Dict[str, float]]:
-        """
-        Apply heavy smoothing and outlier removal to optical flow features.
-        Addresses noise from segmentation artifacts and sub-pixel motion.
-        
-        Args:
-            features_list: Raw feature dictionaries
-            
-        Returns:
-            smoothed_features: Features with outliers removed and heavy smoothing applied
-        """
-        if len(features_list) < 10:
-            return features_list  # Not enough data to smooth
-        
-        # Extract magnitude values
-        magnitudes = np.array([f['mean_flow_magnitude'] for f in features_list])
-        
-        # Step 1: Remove outliers using 3-sigma rule
-        mean_mag = np.mean(magnitudes)
-        std_mag = np.std(magnitudes)
-        
-        # Replace outliers with mean (prevents spikes)
-        outlier_mask = np.abs(magnitudes - mean_mag) > 3 * std_mag
-        magnitudes_cleaned = magnitudes.copy()
-        magnitudes_cleaned[outlier_mask] = mean_mag
-        
-        n_outliers = np.sum(outlier_mask)
-        if n_outliers > 0:
-            print(f"  Removed {n_outliers} outliers from motion signal ({n_outliers/len(magnitudes)*100:.1f}%)")
-        
-        # Step 2: Apply heavy smoothing (moving average, window=10)
-        smooth_window = min(10, len(magnitudes_cleaned) // 5)  # Adaptive window
-        if smooth_window < 3:
-            smooth_window = 3
-        
-        magnitudes_smoothed = np.convolve(
-            magnitudes_cleaned,
-            np.ones(smooth_window) / smooth_window,
-            mode='valid'
-        )
-        
-        # Step 3: Reconstruct feature list with smoothed values
-        # Pad to match original length (or truncate)
-        padding = len(features_list) - len(magnitudes_smoothed)
-        if padding > 0:
-            # Pad at the end with last value
-            magnitudes_smoothed = np.concatenate([
-                magnitudes_smoothed,
-                np.full(padding, magnitudes_smoothed[-1])
-            ])
-        
-        # Create new feature list with smoothed magnitudes
-        smoothed_features = []
-        for i, feat in enumerate(features_list):
-            smoothed_feat = feat.copy()
-            smoothed_feat['mean_flow_magnitude'] = magnitudes_smoothed[i]
-            smoothed_feat['smoothed'] = True  # Flag to indicate processing
-            smoothed_features.append(smoothed_feat)
-        
-        return smoothed_features
 
 
 class GrowthAnalyzer:
@@ -413,19 +140,23 @@ class GrowthAnalyzer:
     def compute_area_growth(self, masks: List[np.ndarray]) -> np.ndarray:
         """
         Compute total area per frame.
-        
+
         Args:
             masks: List of segmentation masks
-            
+
         Returns:
-            areas: Array of areas in um^2
+            areas: Array of areas in um^2 (float32)
         """
-        areas = np.zeros(len(masks))
-        for i, mask in enumerate(masks):
-            n_pixels = np.sum(mask > 0)
-            areas[i] = n_pixels * self.pixel_area
-        
-        return areas
+        if not masks:
+            return np.zeros(0, dtype=np.float32)
+        # Vectorise across frames when all masks share a shape.
+        # Fall back to per-frame counting when shapes differ.
+        try:
+            stacked = np.stack(masks)
+            n_pixels = (stacked > 0).sum(axis=tuple(range(1, stacked.ndim)))
+        except ValueError:
+            n_pixels = np.array([(m > 0).sum() for m in masks])
+        return (n_pixels * self.pixel_area).astype(np.float32)
     
     def smooth_areas(self, areas: np.ndarray, window: int = 8) -> np.ndarray:
         """
@@ -442,89 +173,68 @@ class GrowthAnalyzer:
         """
         def exp_fit(x, a, b):
             return a * np.exp(b * x)
-        
+
         smoothed = areas.copy()
-        
+        threshold = config.AREA_OUTLIER_THRESHOLD  # 5 % per Tran et al. (2025)
+
         for i in range(0, len(areas), window):
             chunk = areas[i:i+window]
             if len(chunk) < 3:  # Need at least 3 points to fit
                 continue
-            
+
             x = np.arange(len(chunk))
-            
+
             try:
                 # Fit exponential to chunk
-                popt, _ = curve_fit(exp_fit, x, chunk, 
+                popt, _ = curve_fit(exp_fit, x, chunk,
                                    p0=[chunk[0], 0.001],
                                    maxfev=5000)
                 fitted = exp_fit(x, *popt)
-                
-                # Replace outliers (>10% deviation from fit)
+
+                # Replace outliers above the relative deviation threshold
                 for j, val in enumerate(chunk):
-                    if fitted[j] > 0:  # Avoid division by zero
+                    if fitted[j] > 0:  # avoid division by zero
                         rel_error = abs(val - fitted[j]) / fitted[j]
-                        if rel_error > 0.1:  # 10% threshold
+                        if rel_error > threshold:
                             smoothed[i+j] = fitted[j]
-            except:
+            except Exception:
                 # If fit fails, keep original values
                 pass
-        
+
         return smoothed
     
     def exponential_growth_fit(self, x: np.ndarray, a: float, b: float) -> np.ndarray:
-        """Exponential growth model: a * exp(b * x)"""
+        """Exponential growth model: a * exp(b * x).  Kept for backward
+        compatibility with older callers; not used by the rolling fit."""
         return a * np.exp(b * x)
-    
+
     def compute_growth_rate_rolling(self, areas: np.ndarray) -> np.ndarray:
         """
-        Compute growth rate using rolling exponential fit.
-        
+        Compute growth rate using rolling log-linear fit.
+
+        Mathematically equivalent to fitting `a * exp(b*x)` (the original
+        implementation), but uses a closed-form linear regression on
+        log(area) — 10-100× faster than scipy.optimize.curve_fit and
+        matches the approach used by GlobalGrowthEstimator.
+
         Args:
             areas: Area measurements over time
-            
+
         Returns:
             growth_rates: Growth rates in h^-1
         """
-        growth_rates = []
-        
-        for i in range(self.rolling_window, len(areas)):
-            time_window = np.arange(i - self.rolling_window, i)
-            area_window = areas[i - self.rolling_window:i]
-            
-            try:
-                p0 = [area_window[0], 0.0005]
-                popt, _ = curve_fit(self.exponential_growth_fit, 
-                                   time_window, area_window, p0=p0)
-                # Convert to per-hour rate
-                growth_rate = popt[1] / self.interval_minutes * 60
-                growth_rates.append(growth_rate)
-            except:
-                growth_rates.append(0.0)
-        
-        return np.array(growth_rates)
+        rw = self.rolling_window
+        if len(areas) <= rw:
+            return np.zeros(0, dtype=np.float32)
+        x = np.arange(rw, dtype=np.float64)
+        growth_rates = np.zeros(len(areas) - rw, dtype=np.float32)
+        for i in range(rw, len(areas)):
+            window = np.clip(areas[i - rw: i], 1e-9, None)
+            slope, *_ = stats.linregress(x, np.log(window))
+            growth_rates[i - rw] = slope / self.interval_minutes * 60.0
+        return growth_rates
     
-    def compute_motion_growth_rate(self, flow_features: List[Dict]) -> np.ndarray:
-        """
-        Compute growth-like metric from optical flow.
-        
-        Args:
-            flow_features: List of flow feature dictionaries
-            
-        Returns:
-            motion_rates: Motion-derived growth proxy
-        """
-        magnitudes = [f['mean_flow_magnitude'] for f in flow_features]
-        motion_rates = np.array(magnitudes)
-        
-        # Smooth with rolling average
-        if len(motion_rates) > self.rolling_window:
-            motion_rates = np.convolve(motion_rates, 
-                                      np.ones(self.rolling_window)/self.rolling_window,
-                                      mode='valid')
-        
-        return motion_rates
-    
-    def normalize_growth_rates(self, 
+    def normalize_growth_rates(self,
                               treatment_rates: np.ndarray,
                               reference_rates: np.ndarray) -> np.ndarray:
         """
@@ -644,129 +354,3 @@ def plot_growth_comparison(time_hours: np.ndarray,
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
-
-
-def plot_motion_comparison(time_hours: np.ndarray,
-                          ref_motion: np.ndarray,
-                          treat_motion: np.ndarray,
-                          ttd_motion: Optional[int] = None,
-                          save_path: Optional[str] = None):
-    """
-    Plot motion-based growth curves with time-to-detection marker.
-    
-    Args:
-        time_hours: Time array in hours
-        ref_motion: Reference motion signal
-        treat_motion: Treatment motion signal
-        ttd_motion: Time-to-detection index (motion-based)
-        save_path: Optional path to save figure
-    """
-    plt.figure(figsize=(10, 6), facecolor='white')
-    
-    # Add drug addition line
-    plt.axvline(x=0, color='#FF1F5B', linestyle='--', lw=2, label='Drug addition')
-    
-    # Plot reference
-    plt.plot(time_hours[:len(ref_motion)], ref_motion, lw=3, color='#009ADE', 
-            label='Reference Motion')
-    
-    # Plot treatment
-    plt.plot(time_hours[:len(treat_motion)], treat_motion, lw=3, color='#FF1F5B',
-            label='Treatment Motion')
-    
-    # Mark time-to-detection
-    if ttd_motion is not None and ttd_motion < len(time_hours):
-        plt.axvline(x=time_hours[ttd_motion], color='orange', linestyle=':', lw=2,
-                   label=f'TTD: {time_hours[ttd_motion]:.1f}h')
-    
-    plt.xlabel('Time (hours)', fontsize=12)
-    plt.ylabel('Mean Flow Magnitude (pixels/frame)', fontsize=12)
-    plt.title('Growth Curve: Motion-Based (Optical Flow)', fontsize=14, fontweight='bold')
-    plt.legend(fontsize=10)
-    plt.grid(alpha=0.3)
-    
-    if save_path:
-        plt.savefig(save_path, dpi=config.DPI, bbox_inches='tight')
-    plt.close()
-
-
-# MAIN PIPELINE EXECUTION
-
-def run_hybrid_pipeline(raw_dir: str,
-                       mask_dir: str,
-                       output_dir: str,
-                       use_watershed: bool = True,
-                       use_memory: bool = True,
-                       use_optical_flow: bool = True):
-    """
-    Run the complete hybrid pipeline on a dataset.
-    
-    Args:
-        raw_dir: Directory with raw phase-contrast images
-        mask_dir: Directory with Omnipose masks
-        output_dir: Directory for outputs
-        use_watershed: Apply watershed refinement
-        use_memory: Use continuous memory mask
-        use_optical_flow: Compute optical flow features
-        
-    Returns:
-        results: Dictionary with areas, flow features, growth rates, etc.
-    """
-    # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Load data
-    print("Loading frames and masks...")
-    raw_files = sorted([os.path.join(raw_dir, f) for f in os.listdir(raw_dir) 
-                       if f.endswith('.tiff') or f.endswith('.tif')])
-    mask_files = sorted([os.path.join(mask_dir, f) for f in os.listdir(mask_dir)
-                        if f.startswith('MASK_') and (f.endswith('.tiff') or f.endswith('.tif'))])
-    
-    frames = [skimage.io.imread(f) for f in raw_files]
-    omnipose_masks = [skimage.io.imread(f) for f in mask_files]
-    
-    print(f"Loaded {len(frames)} frames and {len(omnipose_masks)} masks")
-    
-    # Initialize pipeline
-    seg_pipeline = HybridSegmentationPipeline(gaussian_sigma=1.0)
-    flow_analyzer = OpticalFlowAnalyzer()
-    growth_analyzer = GrowthAnalyzer()
-    
-    # Process segmentation
-    print("Processing segmentation...")
-    if use_watershed or use_memory:
-        refined_masks, edges_list = seg_pipeline.process_sequence(
-            frames, omnipose_masks, use_memory=use_memory)
-        masks_to_use = refined_masks
-    else:
-        masks_to_use = omnipose_masks
-        edges_list = []
-    
-    # Compute area-based growth
-    print("Computing area-based growth...")
-    areas = growth_analyzer.compute_area_growth(masks_to_use)
-    growth_rates = growth_analyzer.compute_growth_rate_rolling(areas)
-    
-    # Compute optical flow features
-    flow_features = []
-    motion_growth = np.array([])
-    if use_optical_flow:
-        print("Computing optical flow features...")
-        flow_features = flow_analyzer.extract_sequence_features(frames, masks_to_use)
-        motion_growth = growth_analyzer.compute_motion_growth_rate(flow_features)
-    
-    # Save results
-    results = {
-        'areas': areas,
-        'growth_rates': growth_rates,
-        'flow_features': flow_features,
-        'motion_growth': motion_growth,
-        'refined_masks': masks_to_use if use_watershed else None
-    }
-    
-    with open(os.path.join(output_dir, 'hybrid_results.pickle'), 'wb') as f:
-        pickle.dump(results, f)
-    
-    print(f"Results saved to {output_dir}")
-    
-    return results

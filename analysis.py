@@ -9,23 +9,24 @@ import os
 import pickle
 import time
 from scipy import stats
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # Import the hybrid pipeline (assuming it's saved as hybrid_pipeline.py)
 from hybrid_pipeline import (
     HybridSegmentationPipeline,
-    OpticalFlowAnalyzer,
     GrowthAnalyzer,
     plot_growth_comparison,
-    plot_motion_comparison
 )
+
+from heteroresistance_detector import HeteroresistanceDetector, plot_heteroresistance_dashboard
+
 import config
 
 import skimage.io
 from sklearn.metrics import jaccard_score
 
-# Create output directory
-os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+# Create output directory on script start
+config.ensure_output_dirs()
 
 
 # HELPER FUNCTIONS
@@ -83,42 +84,32 @@ def process_single_position(raw_pos_dir: str,
     omnipose_masks = omnipose_masks[:min_len]
     
     # Initialize components
-    seg_pipeline = HybridSegmentationPipeline(gaussian_sigma=config.GAUSSIAN_SIGMA, use_watershed=config.USE_WATERSHED)
-    flow_analyzer = OpticalFlowAnalyzer()
+    seg_pipeline = HybridSegmentationPipeline(gaussian_sigma=config.GAUSSIAN_SIGMA)
     growth_analyzer = GrowthAnalyzer(rolling_window=config.ROLLING_WINDOW,
                                     interval_minutes=config.INTERVAL_MINUTES,
                                     pixel_size_um=config.PIXEL_SIZE_UM)
-    
+
     # Process based on method
     if use_hybrid:
-        # Full hybrid pipeline
         refined_masks, edges = seg_pipeline.process_sequence(
             frames, omnipose_masks, use_memory=config.USE_MEMORY)
         masks_to_use = refined_masks
-        
-        # Optical flow
-        flow_features = flow_analyzer.extract_sequence_features(frames, refined_masks)
-        motion_growth = growth_analyzer.compute_motion_growth_rate(flow_features)
     else:
         # Baseline: Omnipose only
         masks_to_use = omnipose_masks
-        flow_features = []
-        motion_growth = np.array([])
-    
+
     # Compute area-based metrics
     areas = growth_analyzer.compute_area_growth(masks_to_use)
-    
+
     # Smooth areas to reduce segmentation noise (Tran et al. 2025 method)
     areas_smoothed = growth_analyzer.smooth_areas(areas, window=8)
-    
+
     # Compute growth rates from smoothed areas
     growth_rates = growth_analyzer.compute_growth_rate_rolling(areas_smoothed)
-    
+
     results = {
         'areas': areas,
         'growth_rates': growth_rates,
-        'flow_features': flow_features,
-        'motion_growth': motion_growth,
         'masks': masks_to_use
     }
     
@@ -136,7 +127,7 @@ def aggregate_positions(position_results: List[Dict],
     
     Args:
         position_results: List of result dictionaries
-        metric: Which metric to aggregate ('areas', 'growth_rates', 'motion_growth')
+        metric: Which metric to aggregate ('areas', 'growth_rates')
         
     Returns:
         mean, std, sem: Aggregated statistics
@@ -172,13 +163,14 @@ def plot_normalized_growth(time_hours: np.ndarray,
     
     # Smooth normalized rates to reduce volatility
     window = 5
+    rw = config.ROLLING_WINDOW
     if len(normalized_rates) >= window:
         smoothed = np.convolve(normalized_rates, np.ones(window)/window, mode='valid')
-        # Adjust time to match smoothed data
-        time_plot = time_hours[16:16+len(smoothed)]
+        # Adjust time to match smoothed data (growth_rates start at frame rw)
+        time_plot = time_hours[rw:rw + len(smoothed)]
     else:
         smoothed = normalized_rates
-        time_plot = time_hours[16:16+len(normalized_rates)]
+        time_plot = time_hours[rw:rw + len(normalized_rates)]
     
     # Add drug addition line
     plt.axvline(x=0, color='#FF1F5B', linestyle='--', lw=2, label='Drug addition')
@@ -233,31 +225,64 @@ def bootstrap_ci(data: np.ndarray, n_bootstrap: int = 1000, ci_level: float = 0.
     return ci_lower, ci_upper
 
 
-def normalize_to_baseline(signal: np.ndarray, baseline_frames: int = 30) -> np.ndarray:
+def detect_separation_sem_overlap(
+    ref_data_list: List[np.ndarray],
+    treat_data_list: List[np.ndarray],
+    time_hours: np.ndarray,
+    min_consecutive: int = 3,
+) -> Optional[float]:
     """
-    Normalize signal to its own pre-drug baseline.
-    Accounts for different initial conditions between sequential experiments.
-    
-    Args:
-        signal: Time series (motion magnitude, area, etc.)
-        baseline_frames: Number of frames to use for baseline (default 30 = 1 hour)
-        
-    Returns:
-        normalized: Signal normalized to baseline mean (baseline = 1.0)
+    Paper-faithful TTD: first time the normalized ±1·SEM bands of the two
+    populations stop overlapping.
+
+    Reproduces the criterion described in Tran et al. (2025):
+        "the separation time of the treatment population from the reference
+         population was based on the time at the separation of the normalized
+         SEM values between the two populations".
+
+    Provides a comparison baseline alongside `compute_ttd_statistics` (which
+    uses bootstrap CIs + per-timepoint t-tests, i.e. a stricter criterion).
+
+    Parameters
+    ----------
+    ref_data_list   : list of (T,) arrays — one signal per reference position
+    treat_data_list : list of (T,) arrays — one signal per treatment position
+    time_hours      : (T,) time axis in hours
+    min_consecutive : require the non-overlap to hold for >= this many
+                      consecutive timepoints before declaring separation
+
+    Returns
+    -------
+    t_sep_hours : float or None
+        The first hour where the SEM bands separate (paper's TTD), or None
+        if the bands never separate over the requested window.
     """
-    if len(signal) < baseline_frames:
-        # Not enough data for baseline, return as-is
-        return signal
-    
-    baseline = signal[:baseline_frames]
-    baseline_mean = np.mean(baseline)
-    
-    if baseline_mean == 0:
-        # Avoid division by zero
-        return signal
-    
-    normalized = signal / baseline_mean
-    return normalized
+    min_len = min(
+        min(len(d) for d in ref_data_list),
+        min(len(d) for d in treat_data_list),
+        len(time_hours),
+    )
+    ref_stack   = np.vstack([d[:min_len] for d in ref_data_list])
+    treat_stack = np.vstack([d[:min_len] for d in treat_data_list])
+
+    ref_mean   = np.mean(ref_stack,   axis=0)
+    treat_mean = np.mean(treat_stack, axis=0)
+    ref_sem    = stats.sem(ref_stack,   axis=0)
+    treat_sem  = stats.sem(treat_stack, axis=0)
+
+    # Separated when treat band sits entirely below ref band
+    # (susceptible: treat < ref).  No-overlap also if treat > ref + sems.
+    sep_below = (ref_mean - ref_sem) > (treat_mean + treat_sem)
+    sep_above = (treat_mean - treat_sem) > (ref_mean + ref_sem)
+    separated = sep_below | sep_above
+
+    # Persistence: require run of >= min_consecutive
+    run = 0
+    for t in range(len(separated)):
+        run = run + 1 if separated[t] else 0
+        if run >= min_consecutive:
+            return float(time_hours[t - min_consecutive + 1])
+    return None
 
 
 def compute_ttd_statistics(ref_data_list: List[np.ndarray],
@@ -450,11 +475,7 @@ def main_analysis():
         aggregate_positions(ref_baseline_results, 'growth_rates')
     ref_hyb_gr_mean, ref_hyb_gr_std, ref_hyb_gr_sem = \
         aggregate_positions(ref_hybrid_results, 'growth_rates')
-    
-    # Motion (hybrid only)
-    ref_motion_mean, ref_motion_std, ref_motion_sem = \
-        aggregate_positions(ref_hybrid_results, 'motion_growth')
-    
+
     ref_processing_time = time.time() - start_time
     print(f"  ✓ Processed {len(ref_baseline_results)} reference positions in {ref_processing_time:.1f}s")
     
@@ -505,11 +526,7 @@ def main_analysis():
         aggregate_positions(treat_baseline_results, 'growth_rates')
     treat_hyb_gr_mean, treat_hyb_gr_std, treat_hyb_gr_sem = \
         aggregate_positions(treat_hybrid_results, 'growth_rates')
-    
-    # Motion (hybrid only)
-    treat_motion_mean, treat_motion_std, treat_motion_sem = \
-        aggregate_positions(treat_hybrid_results, 'motion_growth')
-    
+
     treat_processing_time = time.time() - start_time - ref_processing_time
     print(f"  ✓ Processed {len(treat_baseline_results)} treatment positions in {treat_processing_time:.1f}s")
     
@@ -524,130 +541,71 @@ def main_analysis():
     # Convert to hours
     time_array = np.arange(len(ref_base_area_mean)) * config.INTERVAL_MINUTES / 60
     time_gr = time_array[config.ROLLING_WINDOW:]
-    time_motion = time_array[:len(ref_motion_mean)]
-    
+
     # Extract individual position data for statistical tests
     ref_base_gr_list = [r['growth_rates'] for r in ref_baseline_results]
     treat_base_gr_list = [r['growth_rates'] for r in treat_baseline_results]
-    
+
     ref_hyb_gr_list = [r['growth_rates'] for r in ref_hybrid_results]
     treat_hyb_gr_list = [r['growth_rates'] for r in treat_hybrid_results]
-    
-    ref_motion_list = [r['motion_growth'] for r in ref_hybrid_results]
-    treat_motion_list = [r['motion_growth'] for r in treat_hybrid_results]
-    
-    # Normalize motion signals to pre-drug baseline (handles independent experiments)
-    print("\n  Normalizing motion signals to pre-drug baseline...")
-    baseline_frames = 30  # First 30 frames = t=-1h to -0.5h
-    drug_frame = 30       # Frame where t=0
-    
-    ref_motion_norm = [normalize_to_baseline(m, baseline_frames) for m in ref_motion_list]
-    treat_motion_norm = [normalize_to_baseline(m, baseline_frames) for m in treat_motion_list]
-    
-    # Aggregate normalized signals
-    ref_motion_norm_mean, ref_motion_norm_std, ref_motion_norm_sem = \
-        aggregate_positions([{'motion_growth': m} for m in ref_motion_norm], 'motion_growth')
-    treat_motion_norm_mean, treat_motion_norm_std, treat_motion_norm_sem = \
-        aggregate_positions([{'motion_growth': m} for m in treat_motion_norm], 'motion_growth')
-    
+
     # Statistical TTD calculations with confidence intervals
     print("\n  Computing statistical significance tests...")
-    
+
     # Baseline method (area-based growth rate)
     ttd_stats_baseline = compute_ttd_statistics(
         ref_base_gr_list, treat_base_gr_list, time_gr, alpha=0.05, min_consecutive=3)
-    
+
     # Hybrid method (area-based growth rate)
     ttd_stats_hybrid = compute_ttd_statistics(
         ref_hyb_gr_list, treat_hyb_gr_list, time_gr, alpha=0.05, min_consecutive=3)
-    
-    # Hybrid method (motion-based, normalized, post-drug only)
-    # Only analyze post-drug period (t >= 0) to avoid pre-existing differences
-    time_motion_post = time_motion[drug_frame:]
-    ref_motion_norm_post = [m[drug_frame:] for m in ref_motion_norm]
-    treat_motion_norm_post = [m[drug_frame:] for m in treat_motion_norm]
-    
-    # Motion TTD with detailed diagnostics
-    print("\n" + "="*70)
-    print("MOTION-BASED TTD DIAGNOSTICS")
-    print("="*70)
-    print(f"Post-drug analysis window: {time_motion_post[0]:.2f}h to {time_motion_post[-1]:.2f}h")
-    print(f"Number of post-drug frames: {len(time_motion_post)}")
-    print(f"Number of positions: REF={len(ref_motion_norm_post)}, RIF10={len(treat_motion_norm_post)}")
-    
-    ttd_stats_motion = compute_ttd_statistics(
-        ref_motion_norm_post, treat_motion_norm_post, time_motion_post, alpha=0.05, min_consecutive=3)
-    
-    if ttd_stats_motion and ttd_stats_motion['ttd_hours'] is not None:
-        print(f"\n✅ TTD DETECTED:")
-        print(f"   Time: {ttd_stats_motion['ttd_hours']:.2f}h")
-        print(f"   Frame index: {ttd_stats_motion['ttd_idx']} (of {len(time_motion_post)} post-drug frames)")
-        print(f"   95% CI: [{ttd_stats_motion['ci_lower']:.2f}, {ttd_stats_motion['ci_upper']:.2f}]")
-        print(f"   Min p-value: {ttd_stats_motion['min_p_value']:.2e}")
-        
-        # Check first few frames for effect size
-        print(f"\n📊 Effect size at early timepoints:")
-        for i in range(min(5, len(time_motion_post))):
-            ref_samples = [pos[i] for pos in ref_motion_norm_post]
-            treat_samples = [pos[i] for pos in treat_motion_norm_post]
-            ref_mean = np.mean(ref_samples)
-            treat_mean = np.mean(treat_samples)
-            effect_pct = abs(ref_mean - treat_mean) / ref_mean * 100
-            _, p = stats.ttest_ind(ref_samples, treat_samples)
-            print(f"   t={time_motion_post[i]:.2f}h: REF={ref_mean:.3f}, RIF={treat_mean:.3f}, "
-                  f"Δ={effect_pct:.1f}%, p={p:.2e} {'✓' if p < 0.05 else '✗'}")
-        
-        if ttd_stats_motion['ci_lower'] == ttd_stats_motion['ci_upper']:
-            print(f"\n⚠️  WARNING: Zero-width confidence interval!")
-            print(f"   This means ALL 1000 bootstrap samples detected TTD at exactly frame {ttd_stats_motion['ttd_idx']}")
-            print(f"   Interpretation: Effect is extremely strong and consistent across all positions")
-    else:
-        print(f"\n❌ NO TTD DETECTED")
-        print(f"   No sustained significant divergence found in post-drug period")
-    
-    print("="*70 + "\n")
-    
+
+    # Paper-faithful SEM-overlap baseline (Tran et al. 2025 — no statistical
+    # significance test, just the time the SEM bands stop overlapping).
+    # Reported alongside so we can directly compare against paper numbers.
+    ttd_paper_baseline = detect_separation_sem_overlap(
+        ref_base_gr_list, treat_base_gr_list, time_gr, min_consecutive=3)
+    ttd_paper_hybrid = detect_separation_sem_overlap(
+        ref_hyb_gr_list, treat_hyb_gr_list, time_gr, min_consecutive=3)
+
     # Extract TTD values
     ttd_base_hours = ttd_stats_baseline['ttd_hours']
     ttd_hyb_area_hours = ttd_stats_hybrid['ttd_hours']
-    ttd_hyb_motion_hours = ttd_stats_motion['ttd_hours']
-    
+
     # Use indices for plotting (from original simple method for backward compatibility)
     ttd_baseline = growth_analyzer.detect_divergence_time(
         ref_base_gr_mean, treat_base_gr_mean, alpha=0.05, min_consecutive=3)
     ttd_hybrid_area = growth_analyzer.detect_divergence_time(
         ref_hyb_gr_mean, treat_hyb_gr_mean, alpha=0.05, min_consecutive=3)
-    ttd_hybrid_motion = growth_analyzer.detect_divergence_time(
-        ref_motion_mean, treat_motion_mean, alpha=0.05, min_consecutive=3)
-    
+
     # Print results with confidence intervals
     print(f"\n  TIME-TO-DETECTION RESULTS (with 95% Confidence Intervals):")
     print(f"  {'Method':<30} {'TTD (hours)':<25} {'Min p-value':<15}")
     print(f"  {'-'*70}")
-    
+
     if ttd_base_hours is not None:
         ci_str = f"[{ttd_stats_baseline['ci_lower']:.2f}, {ttd_stats_baseline['ci_upper']:.2f}]"
         print(f"  {'Baseline (Omnipose + Area)':<30} {ttd_base_hours:>6.2f}h  95% CI: {ci_str:<10}  {ttd_stats_baseline['min_p_value']:.2e}")
     else:
         print(f"  {'Baseline (Omnipose + Area)':<30} {'Not detected':>25}")
-    
+
     if ttd_hyb_area_hours is not None:
         ci_str = f"[{ttd_stats_hybrid['ci_lower']:.2f}, {ttd_stats_hybrid['ci_upper']:.2f}]"
         print(f"  {'Hybrid (Area-based)':<30} {ttd_hyb_area_hours:>6.2f}h  95% CI: {ci_str:<10}  {ttd_stats_hybrid['min_p_value']:.2e}")
     else:
         print(f"  {'Hybrid (Area-based)':<30} {'Not detected':>25}")
-    
-    if ttd_hyb_motion_hours is not None:
-        ci_str = f"[{ttd_stats_motion['ci_lower']:.2f}, {ttd_stats_motion['ci_upper']:.2f}]"
-        print(f"  {'Hybrid (Motion, normalized)':<30} {ttd_hyb_motion_hours:>6.2f}h  95% CI: {ci_str:<10}  {ttd_stats_motion['min_p_value']:.2e}")
+
+    # Paper-faithful baseline (no statistical test, just SEM-band separation)
+    print(f"\n  PAPER-STYLE BASELINE (Tran et al. 2025 — SEM-overlap criterion):")
+    if ttd_paper_baseline is not None:
+        print(f"  {'Baseline (paper SEM)':<30} {ttd_paper_baseline:>6.2f}h")
     else:
-        print(f"  {'Hybrid (Motion, normalized)':<30} {'Not detected':>25}")
-    
-    # Calculate improvement
-    if ttd_base_hours and ttd_hyb_motion_hours:
-        improvement = ttd_base_hours - ttd_hyb_motion_hours
-        print(f"\n  ⚡ Motion-based detection is {improvement:.2f}h faster! (p < {ttd_stats_motion['min_p_value']:.2e})")
-    
+        print(f"  {'Baseline (paper SEM)':<30} {'Not detected':>25}")
+    if ttd_paper_hybrid is not None:
+        print(f"  {'Hybrid   (paper SEM)':<30} {ttd_paper_hybrid:>6.2f}h")
+    else:
+        print(f"  {'Hybrid   (paper SEM)':<30} {'Not detected':>25}")
+
     ttd_time = time.time() - start_time - ref_processing_time - treat_processing_time
     print(f"\n  Completed statistical analysis in {ttd_time:.1f}s")
     
@@ -660,53 +618,21 @@ def main_analysis():
     plot_growth_comparison(
         time_array, ref_base_area_mean, treat_base_area_mean,
         ref_base_area_sem, treat_base_area_sem,
-        ttd_area=ttd_baseline + config.ROLLING_WINDOW if ttd_baseline else None,
+        ttd_area=(ttd_baseline + config.ROLLING_WINDOW
+                  if ttd_baseline is not None else None),
         save_path=os.path.join(config.OUTPUT_DIR, "baseline_area_growth.png")
     )
-    
+
     # Plot 2: Area growth comparison (hybrid)
     plot_growth_comparison(
         time_array, ref_hyb_area_mean, treat_hyb_area_mean,
         ref_hyb_area_sem, treat_hyb_area_sem,
-        ttd_area=ttd_hybrid_area + config.ROLLING_WINDOW if ttd_hybrid_area else None,
+        ttd_area=(ttd_hybrid_area + config.ROLLING_WINDOW
+                  if ttd_hybrid_area is not None else None),
         save_path=os.path.join(config.OUTPUT_DIR, "hybrid_area_growth.png")
     )
     
-    # Plot 3: Motion-based growth comparison (normalized)
-    plt.figure(figsize=(12, 6), facecolor='white')
-    
-    plt.axvline(x=0, color='#FF1F5B', linestyle='--', linewidth=2, label='Drug addition')
-    plt.axhline(y=1.0, color='gray', linestyle=':', linewidth=1, alpha=0.7, label='Pre-drug baseline')
-    
-    plt.plot(time_motion, ref_motion_norm_mean, linewidth=2, color='#009ADE', label='REF (normalized)')
-    plt.fill_between(time_motion, 
-                     ref_motion_norm_mean - ref_motion_norm_sem,
-                     ref_motion_norm_mean + ref_motion_norm_sem,
-                     alpha=0.3, color='#009ADE')
-    
-    plt.plot(time_motion, treat_motion_norm_mean, linewidth=2, color='#FF1F5B', label='RIF10 (normalized)')
-    plt.fill_between(time_motion,
-                     treat_motion_norm_mean - treat_motion_norm_sem,
-                     treat_motion_norm_mean + treat_motion_norm_sem,
-                     alpha=0.3, color='#FF1F5B')
-    
-    # Use statistical TTD result (correct)
-    if ttd_hyb_motion_hours is not None:
-        plt.axvline(x=ttd_hyb_motion_hours, color='orange', linestyle=':', linewidth=2,
-                   label=f'TTD: {ttd_hyb_motion_hours:.2f}h post-drug')
-    
-    plt.xlabel('Time (hours)', fontsize=12)
-    plt.ylabel('Normalized Motion Magnitude (baseline = 1.0)', fontsize=12)
-    plt.title('Motion-Based Detection: Normalized to Pre-Drug Baseline', fontsize=14, fontweight='bold')
-    plt.legend(fontsize=10)
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(os.path.join(config.OUTPUT_DIR, "hybrid_motion_normalized.png"), dpi=config.DPI)
-    plt.close()
-    
-    print(f"  ✓ Saved: hybrid_motion_normalized.png")
-    
-    # Plot 4: Growth rate comparison (all methods)
+    # Plot 3: Growth rate comparison (baseline vs hybrid)
     fig, axes = plt.subplots(2, 2, figsize=(14, 10), facecolor='white')
     
     # Growth rates - baseline
@@ -747,23 +673,15 @@ def main_analysis():
     axes[1, 0].legend()
     axes[1, 0].grid(alpha=0.3)
     
-    # Motion signal (normalized)
-    axes[1, 1].axvline(x=0, color='#FF1F5B', linestyle='--', lw=1, alpha=0.5, label='Drug addition')
-    axes[1, 1].axhline(y=1.0, color='gray', linestyle=':', lw=1, alpha=0.5, label='Baseline')
-    axes[1, 1].plot(time_motion, ref_motion_norm_mean, lw=2, color='#009ADE', label='REF (normalized)')
-    axes[1, 1].fill_between(time_motion, ref_motion_norm_mean - ref_motion_norm_sem,
-                           ref_motion_norm_mean + ref_motion_norm_sem, alpha=0.3, color='#009ADE')
-    axes[1, 1].plot(time_motion, treat_motion_norm_mean, lw=2, color='#FF1F5B', label='RIF10 (normalized)')
-    axes[1, 1].fill_between(time_motion, treat_motion_norm_mean - treat_motion_norm_sem,
-                           treat_motion_norm_mean + treat_motion_norm_sem, alpha=0.3, color='#FF1F5B')
-    # Use statistical TTD result (correct)
-    if ttd_hyb_motion_hours is not None:
-        axes[1, 1].axvline(x=ttd_hyb_motion_hours, color='orange',
-                          linestyle=':', lw=2, label=f'TTD: {ttd_hyb_motion_hours:.2f}h')
-    axes[1, 1].set_title('Hybrid: Motion Signal (Baseline Normalized)', fontweight='bold')
+    # Treatment variability (hybrid vs baseline)
+    axes[1, 1].plot(time_gr, treat_base_gr_std, lw=2, color='#FF1F5B',
+                    label='Baseline RIF10', linestyle='--')
+    axes[1, 1].plot(time_gr_hyb, treat_hyb_gr_std, lw=2, color='#FF1F5B',
+                    label='Hybrid RIF10')
+    axes[1, 1].set_title('Treatment Variability (Std Dev)', fontweight='bold')
     axes[1, 1].set_xlabel('Time (hours)')
-    axes[1, 1].set_ylabel('Normalized Flow Magnitude')
-    axes[1, 1].legend(fontsize=8)
+    axes[1, 1].set_ylabel('Standard Deviation')
+    axes[1, 1].legend()
     axes[1, 1].grid(alpha=0.3)
     
     plt.tight_layout()
@@ -793,10 +711,10 @@ def main_analysis():
         'n_treat_positions': len(treat_baseline_results),
         'ttd_baseline_hours': ttd_base_hours,
         'ttd_hybrid_area_hours': ttd_hyb_area_hours,
-        'ttd_hybrid_motion_hours': ttd_hyb_motion_hours,
+        'ttd_paper_baseline_hours': ttd_paper_baseline,
+        'ttd_paper_hybrid_hours':   ttd_paper_hybrid,
         'ttd_stats_baseline': ttd_stats_baseline,
         'ttd_stats_hybrid': ttd_stats_hybrid,
-        'ttd_stats_motion': ttd_stats_motion,
         'ref_baseline_area_mean': ref_base_area_mean,
         'ref_hybrid_area_mean': ref_hyb_area_mean,
         'treat_baseline_area_mean': treat_base_area_mean,
@@ -834,17 +752,11 @@ def main_analysis():
         print(f"  Hybrid (area):   {report['ttd_hybrid_area_hours']:.2f}h  (95% CI: {ci_hyb})")
     else:
         print(f"  Hybrid (area):   Not detected")
-    
-    if report['ttd_hybrid_motion_hours']:
-        ci_mot = f"[{report['ttd_stats_motion']['ci_lower']:.2f}, {report['ttd_stats_motion']['ci_upper']:.2f}]"
-        print(f"  Hybrid (motion): {report['ttd_hybrid_motion_hours']:.2f}h  (95% CI: {ci_mot})")
-    else:
-        print(f"  Hybrid (motion): Not detected")
-    
-    if report['ttd_baseline_hours'] and report['ttd_hybrid_motion_hours']:
-        improvement = report['ttd_baseline_hours'] - report['ttd_hybrid_motion_hours']
-        p_val = report['ttd_stats_motion']['min_p_value']
-        print(f"\n✨ Improvement: {improvement:.2f}h faster detection with motion features!")
+
+    if report['ttd_baseline_hours'] and report['ttd_hybrid_area_hours']:
+        improvement = report['ttd_baseline_hours'] - report['ttd_hybrid_area_hours']
+        p_val = report['ttd_stats_hybrid']['min_p_value']
+        print(f"\n✨ Improvement: {improvement:.2f}h faster detection with hybrid (memory mask)")
         print(f"   Statistical significance: p < {p_val:.2e}")
     
     total_time = time.time() - start_time

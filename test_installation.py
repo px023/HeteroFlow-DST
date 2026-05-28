@@ -80,14 +80,6 @@ class TestPipelineImport(unittest.TestCase):
         except ImportError as e:
             self.fail(f"Cannot import HybridSegmentationPipeline: {e}")
     
-    def test_optical_flow_import(self):
-        """Test OpticalFlowAnalyzer class can be imported"""
-        try:
-            from hybrid_pipeline import OpticalFlowAnalyzer
-            self.assertTrue(True)
-        except ImportError as e:
-            self.fail(f"Cannot import OpticalFlowAnalyzer: {e}")
-    
     def test_growth_analyzer_import(self):
         """Test GrowthAnalyzer class can be imported"""
         try:
@@ -114,26 +106,16 @@ class TestPipelineInstantiation(unittest.TestCase):
         pipeline = HybridSegmentationPipeline()
         self.assertIsNotNone(pipeline)
         self.assertEqual(pipeline.gaussian_sigma, 1.0)
-        self.assertEqual(pipeline.use_watershed, False)
-    
+
     def test_segmentation_pipeline_custom_params(self):
         """Test HybridSegmentationPipeline with custom parameters"""
         from hybrid_pipeline import HybridSegmentationPipeline
         pipeline = HybridSegmentationPipeline(
             gaussian_sigma=2.0,
             sobel_ksize=5,
-            use_watershed=True
         )
         self.assertEqual(pipeline.gaussian_sigma, 2.0)
         self.assertEqual(pipeline.sobel_ksize, 5)
-        self.assertTrue(pipeline.use_watershed)
-    
-    def test_optical_flow_instantiation(self):
-        """Test OpticalFlowAnalyzer can be instantiated"""
-        from hybrid_pipeline import OpticalFlowAnalyzer
-        analyzer = OpticalFlowAnalyzer()
-        self.assertIsNotNone(analyzer)
-        self.assertEqual(analyzer.lk_params['winSize'], (15, 15))
     
     def test_growth_analyzer_instantiation(self):
         """Test GrowthAnalyzer can be instantiated"""
@@ -169,32 +151,6 @@ class TestPreprocessing(unittest.TestCase):
         self.assertLessEqual(np.var(blurred), np.var(self.test_frame))
 
 
-class TestWatershed(unittest.TestCase):
-    """Test suite for watershed refinement"""
-    
-    def setUp(self):
-        """Set up test fixtures"""
-        from hybrid_pipeline import HybridSegmentationPipeline
-        self.pipeline = HybridSegmentationPipeline(use_watershed=True)
-        self.test_frame = np.random.randint(0, 255, (512, 512), dtype=np.uint8)
-        self.test_mask = np.zeros((512, 512), dtype=np.uint16)
-        self.test_mask[200:300, 200:300] = 1
-        self.test_mask[350:400, 350:400] = 2
-    
-    def test_watershed_output_shape(self):
-        """Test watershed output has correct shape"""
-        _, edges = self.pipeline.preprocess_frame(self.test_frame)
-        refined = self.pipeline.watershed_refinement(edges, self.test_mask)
-        self.assertEqual(refined.shape, self.test_mask.shape)
-    
-    def test_watershed_preserves_mask_regions(self):
-        """Test watershed preserves at least some mask regions"""
-        _, edges = self.pipeline.preprocess_frame(self.test_frame)
-        refined = self.pipeline.watershed_refinement(edges, self.test_mask)
-        # Should have at least 1 region
-        self.assertGreater(np.max(refined), 0)
-
-
 class TestMemoryMask(unittest.TestCase):
     """Test suite for memory mask functionality"""
     
@@ -225,36 +181,6 @@ class TestMemoryMask(unittest.TestCase):
         
         # Memory should have both regions
         self.assertGreater(np.sum(memory2), np.sum(mask1) + np.sum(mask2) - 10000)
-
-
-class TestOpticalFlow(unittest.TestCase):
-    """Test suite for optical flow analysis"""
-    
-    def setUp(self):
-        """Set up test fixtures"""
-        from hybrid_pipeline import OpticalFlowAnalyzer
-        self.analyzer = OpticalFlowAnalyzer()
-        self.frame1 = np.random.randint(0, 255, (512, 512), dtype=np.uint8)
-        self.frame2 = self.frame1 + np.random.randint(-5, 5, (512, 512)).astype(np.uint8)
-        self.mask = np.zeros((512, 512), dtype=np.uint16)
-        self.mask[200:300, 200:300] = 1
-    
-    def test_flow_features_dict(self):
-        """Test compute_flow_features returns dictionary"""
-        features = self.analyzer.compute_flow_features(self.frame1, self.frame2, self.mask)
-        self.assertIsInstance(features, dict)
-    
-    def test_flow_features_keys(self):
-        """Test flow features contain expected keys"""
-        features = self.analyzer.compute_flow_features(self.frame1, self.frame2, self.mask)
-        expected_keys = ['mean_flow_magnitude', 'directional_consistency']
-        for key in expected_keys:
-            self.assertIn(key, features)
-    
-    def test_flow_magnitude_non_negative(self):
-        """Test flow magnitude is non-negative"""
-        features = self.analyzer.compute_flow_features(self.frame1, self.frame2, self.mask)
-        self.assertGreaterEqual(features['mean_flow_magnitude'], 0)
 
 
 class TestGrowthAnalysis(unittest.TestCase):
@@ -353,11 +279,9 @@ if __name__ == "__main__":
     print("Tests organized into categories:")
     print("  • Dependencies (6 tests)")
     print("  • Pipeline Import (4 tests)")
-    print("  • Instantiation (4 tests)")
+    print("  • Instantiation (3 tests)")
     print("  • Preprocessing (3 tests)")
-    print("  • Watershed (2 tests)")
     print("  • Memory Mask (2 tests)")
-    print("  • Optical Flow (3 tests)")
     print("  • Growth Analysis (3 tests)")
     print("  • Configuration (3 tests)")
     print("\n" + "="*70)
@@ -379,9 +303,7 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(TestPipelineImport))
     suite.addTests(loader.loadTestsFromTestCase(TestPipelineInstantiation))
     suite.addTests(loader.loadTestsFromTestCase(TestPreprocessing))
-    suite.addTests(loader.loadTestsFromTestCase(TestWatershed))
     suite.addTests(loader.loadTestsFromTestCase(TestMemoryMask))
-    suite.addTests(loader.loadTestsFromTestCase(TestOpticalFlow))
     suite.addTests(loader.loadTestsFromTestCase(TestGrowthAnalysis))
     suite.addTests(loader.loadTestsFromTestCase(TestConfig))
     

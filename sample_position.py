@@ -6,9 +6,9 @@ import skimage.io
 from skimage.segmentation import mark_boundaries
 from hybrid_pipeline import (
     HybridSegmentationPipeline,
-    OpticalFlowAnalyzer,
-    GrowthAnalyzer
+    GrowthAnalyzer,
 )
+
 import config
 
 # INTERACTIVE FRAME VIEWER
@@ -271,60 +271,45 @@ def single_position(position=None, is_treatment=False):
     seg_pipeline = HybridSegmentationPipeline(
         gaussian_sigma=config.GAUSSIAN_SIGMA,
         sobel_ksize=config.SOBEL_KSIZE,
-        watershed_min_distance=config.WATERSHED_MIN_DISTANCE,
-        use_watershed=config.USE_WATERSHED
     )
-    
-    flow_analyzer = OpticalFlowAnalyzer(
-        lk_win_size=config.LK_WIN_SIZE,
-        lk_max_level=config.LK_MAX_LEVEL
-    )
-    
+
     growth_analyzer = GrowthAnalyzer(
         rolling_window=config.ROLLING_WINDOW,
         interval_minutes=config.INTERVAL_MINUTES,
         pixel_size_um=config.PIXEL_SIZE_UM
     )
-    
+
     # Process with hybrid pipeline
     print("1. Applying Gaussian blur + Sobel edges...")
-    print("2. Refining segmentation with watershed...")
-    print("3. Applying continuous memory mask...")
-    
+    print("2. Applying continuous memory mask...")
+
     refined_masks, edges = seg_pipeline.process_sequence(
         frames, omnipose_masks, use_memory=True)
-    
+
     print(f"✓ Segmentation complete! Refined {len(refined_masks)} masks")
-    
-    # Compute optical flow
-    print("\n4. Computing optical flow features...")
-    flow_features = flow_analyzer.extract_sequence_features(frames, refined_masks)
-    print(f"✓ Flow features extracted for {len(flow_features)} frame pairs")
-    
+
     # Compute growth metrics
-    print("\n5. Computing growth metrics...")
+    print("\n3. Computing growth metrics...")
     areas = growth_analyzer.compute_area_growth(refined_masks)
     growth_rates = growth_analyzer.compute_growth_rate_rolling(areas)
-    motion_growth = growth_analyzer.compute_motion_growth_rate(flow_features)
-    
+
     print(f"✓ Areas computed: {len(areas)} time points")
     print(f"✓ Growth rates: {len(growth_rates)} time points")
-    print(f"✓ Motion features: {len(motion_growth)} time points")
-    
+
     # Launch interactive frame viewer
     print("\n" + "-"*70)
     print("Launching Interactive Frame Viewer...")
     print("-"*70)
     print("Use slider or arrow keys to navigate frames")
     print("Close the window when done to continue...")
-    
+
     view_frames_interactive(frames, omnipose_masks, refined_masks, edges)
-    
+
     # Plot growth curves
     time_hours = config.get_time_array(len(areas), start_at_zero=True)
     
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4), facecolor='white')
-    
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), facecolor='white')
+
     # Area growth
     axes[0].plot(time_hours, areas, lw=2, color='#009ADE')
     axes[0].axvline(x=0, color='red', linestyle='--', alpha=0.5, label='Drug addition')
@@ -333,7 +318,7 @@ def single_position(position=None, is_treatment=False):
     axes[0].set_title('Area Growth')
     axes[0].grid(alpha=0.3)
     axes[0].legend()
-    
+
     # Growth rate
     time_gr = time_hours[config.ROLLING_WINDOW:]
     if len(growth_rates) > 0:
@@ -343,20 +328,17 @@ def single_position(position=None, is_treatment=False):
         axes[1].set_ylabel('Growth Rate (h⁻¹)')
         axes[1].set_title('Growth Rate')
         axes[1].grid(alpha=0.3)
-    
-    # Motion signal
-    if len(motion_growth) > 0:
-        axes[2].plot(time_hours[:len(motion_growth)], motion_growth, lw=2, color='#FF1F5B')
-        axes[2].axvline(x=0, color='red', linestyle='--', alpha=0.5)
-        axes[2].set_xlabel('Time (hours)')
-        axes[2].set_ylabel('Flow Magnitude')
-        axes[2].set_title('Motion Signal (Optical Flow)')
-        axes[2].grid(alpha=0.3)
-    
+
     plt.tight_layout()
     plt.savefig(os.path.join(config.SAMPLE_OUTPUT_DIR, f"growth_curves_Pos{position}.png"), dpi=config.DPI)
     plt.show()
-    
+
+    print(
+        "\nFor heteroresistance detection (Strategies B + C) run "
+        "test_heteroresistance_real_data.py — sample_position.py is a "
+        "single-position viewer only."
+    )
+
     print(f"\n✓ Results saved to: {config.SAMPLE_OUTPUT_DIR}")
     print("\n" + "="*70)
     print("Example 1 Complete!")
@@ -364,7 +346,6 @@ def single_position(position=None, is_treatment=False):
     print(f"\nKey Results for Pos{position} ({group_name}):")
     print(f"  • Mean area: {np.mean(areas):.1f} μm²")
     print(f"  • Mean growth rate: {np.mean(growth_rates):.3f} h⁻¹" if len(growth_rates) > 0 else "")
-    print(f"  • Mean flow magnitude: {np.mean(motion_growth):.2f}" if len(motion_growth) > 0 else "")
     
 
 if __name__ == "__main__":
@@ -373,7 +354,8 @@ if __name__ == "__main__":
     print("\nThis script demonstrates processing a single position with the hybrid pipeline")
     print("\n⚠️  Configuration loaded from config.py")
     print("="*70)
-    
+
+    config.ensure_output_dirs()
     single_position()
     
     print(f"\nOutputs saved to: {config.SAMPLE_OUTPUT_DIR}")

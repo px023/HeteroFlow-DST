@@ -2,7 +2,7 @@
 Interactive Parameter Tuning Tool for Hybrid Pipeline
 
 This script helps you find optimal parameters by visualizing results
-with different gaussian_sigma, sobel_ksize, and watershed_min_distance values.
+with different gaussian_sigma and sobel_ksize values.
 
 PS: We don't really see much of a change with sigma and sobel sizes at the moment
 """
@@ -29,8 +29,6 @@ class ParameterTuner:
         # Initial parameters
         self.gaussian_sigma = 1.0
         self.sobel_ksize = 3
-        self.watershed_min_distance = 5
-        self.use_watershed = False
         self.use_memory = False
         
         # Create figure with subplots and sliders
@@ -72,22 +70,12 @@ class ParameterTuner:
         self.slider_sobel = Slider(ax_sobel, 'Sobel Kernel', 1, 15,
                                    valinit=3, valstep=2, color='#4ECDC4')
         self.slider_sobel.on_changed(self.update_sobel)
-        
-        # Watershed min distance slider
-        ax_watershed = plt.axes([slider_left, 0.06, slider_width, 0.02])
-        self.slider_watershed = Slider(ax_watershed, 'Watershed Dist', 1, 20,
-                                       valinit=5, valstep=1, color='#95E1D3')
-        self.slider_watershed.on_changed(self.update_watershed)
-        
+
         # Buttons
-        ax_btn_watershed = plt.axes([0.55, 0.14, 0.15, 0.03])
-        self.btn_watershed = Button(ax_btn_watershed, 'Watershed: OFF')
-        self.btn_watershed.on_clicked(self.toggle_watershed)
-        
         ax_btn_memory = plt.axes([0.55, 0.10, 0.15, 0.03])
         self.btn_memory = Button(ax_btn_memory, 'Memory: OFF')
         self.btn_memory.on_clicked(self.toggle_memory)
-        
+
         ax_btn_reset = plt.axes([0.55, 0.06, 0.15, 0.03])
         self.btn_reset = Button(ax_btn_reset, 'Reset to Defaults')
         self.btn_reset.on_clicked(self.reset_params)
@@ -114,33 +102,18 @@ class ParameterTuner:
         """Update sobel kernel size"""
         self.sobel_ksize = int(self.slider_sobel.val)
         self.update_display()
-    
-    def update_watershed(self, val):
-        """Update watershed min distance"""
-        self.watershed_min_distance = int(self.slider_watershed.val)
-        if self.use_watershed:
-            self.update_display()
-    
-    def toggle_watershed(self, event):
-        """Toggle watershed on/off"""
-        self.use_watershed = not self.use_watershed
-        self.btn_watershed.label.set_text(f'Watershed: {"ON" if self.use_watershed else "OFF"}')
-        self.update_display()
-    
+
     def toggle_memory(self, event):
         """Toggle memory mask on/off"""
         self.use_memory = not self.use_memory
         self.btn_memory.label.set_text(f'Memory: {"ON" if self.use_memory else "OFF"}')
         self.update_display()
-    
+
     def reset_params(self, event):
         """Reset to default parameters"""
         self.slider_sigma.set_val(1.0)
         self.slider_sobel.set_val(3)
-        self.slider_watershed.set_val(5)
-        self.use_watershed = False
         self.use_memory = False
-        self.btn_watershed.label.set_text('Watershed: OFF')
         self.btn_memory.label.set_text('Memory: OFF')
         self.update_display()
     
@@ -166,18 +139,12 @@ class ParameterTuner:
         pipeline = HybridSegmentationPipeline(
             gaussian_sigma=self.gaussian_sigma,
             sobel_ksize=self.sobel_ksize,
-            watershed_min_distance=self.watershed_min_distance,
-            use_watershed=self.use_watershed
         )
-        
+
         # Process current frame
         blurred, edges = pipeline.preprocess_frame(frame)
-        
-        if self.use_watershed:
-            refined_mask = pipeline.watershed_refinement(edges, omni_mask)
-        else:
-            refined_mask = omni_mask.copy()
-        
+        refined_mask = omni_mask.copy()
+
         # Apply memory if enabled (need to process from start)
         if self.use_memory and idx > 0:
             refined_masks, _ = pipeline.process_sequence(
@@ -250,8 +217,6 @@ class ParameterTuner:
         info += f"Frame: {idx}/{self.n_frames-1}\n"
         info += f"Gaussian σ: {self.gaussian_sigma:.2f}\n"
         info += f"Sobel kernel: {self.sobel_ksize}\n"
-        info += f"Watershed dist: {self.watershed_min_distance}\n"
-        info += f"Watershed: {'ON' if self.use_watershed else 'OFF'}\n"
         info += f"Memory: {'ON' if self.use_memory else 'OFF'}\n\n"
         info += f"Results:\n"
         info += f"Cell count change: {refined_cells - omni_cells:+d}\n"
